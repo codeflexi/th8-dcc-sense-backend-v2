@@ -48,15 +48,14 @@ class SelectionService:
     # Public API
     # =====================================================
     def select_for_case(self, case_id: str, domain_code: str) -> Dict[str, Any]:
-        
-       
-        
         policy = PolicyRegistry.get_bundle()
-        
         resolved_policy = resolve_domain_policy(policy, domain_code)
 
+        # YAML you shared: meta.defaults.currency
         currency_default = (
-            getattr(getattr(policy, "meta", None), "currency_default", None) or "THB"
+            getattr(getattr(getattr(policy, "meta", None), "defaults", None), "currency", None)
+            or (getattr(getattr(policy, "meta", None), "currency_default", None))  # backward compat
+            or "THB"
         )
 
         # PO is optional context (never anchor)
@@ -74,7 +73,7 @@ class SelectionService:
                 currency_default=currency_default,
                 domain_code=domain_code,
             )
-            selection = self._select_for_group(group_ctx, resolved_policy)
+            selection = self._select_for_group(group_ctx, resolved_policy, domain_code)
             results.append(selection)
 
         return {"case_id": case_id, "domain": domain_code, "groups": results}
@@ -86,10 +85,11 @@ class SelectionService:
         self,
         group_ctx: Dict[str, Any],
         resolved_policy,
+        domain_code: str,
     ) -> Dict[str, Any]:
-        profile = resolved_policy.profile
+        profile = getattr(resolved_policy, "profile", {}) or {}
 
-# -------- baseline_priority safe --------
+        # -------- baseline_priority safe --------
         if isinstance(profile, dict):
             baseline_priority = profile.get("baseline_priority", []) or []
         else:
@@ -98,15 +98,17 @@ class SelectionService:
         # -------- techniques safe --------
         techniques = getattr(resolved_policy, "techniques", None)
 
+        # fallback: policy.domains[domain_code].techniques
         if not techniques:
             bundle = PolicyRegistry.get_bundle()
-            domain = bundle.domains.get(group_ctx.get("domain"))
+            domains = getattr(bundle, "domains", None) or {}
+            domain = domains.get(domain_code)
             if domain:
                 techniques = getattr(domain, "techniques", None)
 
-        # 🔥 FINAL GUARD (ปิด error นี้ถาวร)
         if not isinstance(techniques, dict):
             techniques = {}
+
         trace: List[Dict[str, Any]] = []
         selected = None
 
@@ -119,11 +121,12 @@ class SelectionService:
         for tech_id in baseline_priority:
             tech = techniques.get(tech_id)
             if not tech:
+                # keep deterministic: skip missing technique id
                 continue
 
             r = self._evaluate_technique(group_ctx, tech)
             trace.append(r)
-            if r["passed"]:
+            if r.get("passed") is True:
                 selected = r
                 break
 
@@ -152,9 +155,9 @@ class SelectionService:
                 "sku": gk if isinstance(gk, str) and gk.startswith("SKU:") else None,
                 "name": None,
             },
-            "selected_technique": selected["technique_id"],
-            "baseline": selected["baseline"],
-            "baseline_source": selected["baseline_source"],
+            "selected_technique": selected.get("technique_id"),
+            "baseline": selected.get("baseline"),
+            "baseline_source": selected.get("baseline_source"),
             "readiness_flags": {
                 "baseline_available": selected.get("baseline") is not None,
                 "evidence_present": len(ctx.get("evidences") or []) > 0,
@@ -169,24 +172,28 @@ class SelectionService:
     # Technique Evaluation
     # =====================================================
     def _evaluate_technique(self, ctx: Dict[str, Any], tech) -> Dict[str, Any]:
+        tech_id = self._tech_id(tech)
+
         # required facts
-        for ft in getattr(tech, "required_facts", []) or []:
+        required_facts = self._tech_required_facts(tech)
+        for ft in required_facts:
             if ft not in (ctx.get("facts") or {}):
-                return self._fail(tech.id, [f"MISSING_FACT:{ft}"])
+                return self._fail(tech_id, [f"MISSING_FACT:{ft}"])
 
         # gates
-        gates = getattr(tech, "gates", None) or {}
+        gates = self._tech_gates(tech)
         if gates:
             gate_err = self._check_gates(ctx, gates)
             if gate_err:
-                return self._fail(tech.id, gate_err)
+                return self._fail(tech_id, gate_err)
 
         # baseline derive
-        if getattr(tech, "category", None) == "BASELINE":
+        category = self._tech_category(tech)
+        if category == "BASELINE":
             return self._derive(ctx, tech)
 
         return {
-            "technique_id": tech.id,
+            "technique_id": tech_id,
             "passed": True,
             "baseline": None,
             "baseline_source": None,
@@ -224,17 +231,20 @@ class SelectionService:
         return errs
 
     def _derive(self, ctx: Dict[str, Any], tech) -> Dict[str, Any]:
-        cfg = getattr(tech, "derive", None) or {}
+        tech_id = self._tech_id(tech)
+        cfg = self._tech_derive(tech)
         ft = cfg.get("baseline_from")
         fact = (ctx.get("facts") or {}).get(ft)
 
+        if not ft:
+            return self._fail(tech_id, ["BASELINE_FROM_MISSING"])
         if not fact:
-            return self._fail(tech.id, [f"MISSING_FACT:{ft}"])
+            return self._fail(tech_id, [f"MISSING_FACT:{ft}"])
 
         vj = fact.get("value_json") or {}
         value = vj.get("price")
         if value is None:
-            return self._fail(tech.id, ["PRICE_VALUE_MISSING"])
+            return self._fail(tech_id, ["PRICE_VALUE_MISSING"])
 
         # currency precedence:
         currency = vj.get("currency") or ctx.get("currency")
@@ -242,10 +252,10 @@ class SelectionService:
         # method_required
         method_required = cfg.get("method_required")
         if method_required and vj.get("method") != method_required:
-            return self._fail(tech.id, ["FACT_METHOD_MISMATCH"])
+            return self._fail(tech_id, ["FACT_METHOD_MISMATCH"])
 
         return {
-            "technique_id": tech.id,
+            "technique_id": tech_id,
             "passed": True,
             "baseline": {"value": value, "currency": currency},
             "baseline_source": {"fact_type": ft, "method": vj.get("method")},
@@ -275,7 +285,6 @@ class SelectionService:
         anchor_id = group.get("anchor_id")
 
         # CRITICAL: evidences are owned by group_id (same as facts)
-        # Use group_id-only read to comply with contract and avoid case_id+group_id coupling.
         evidences = self.evidence_repo.list_by_group_id(group_id)
 
         # CRITICAL: facts are OWNED by group_id only
@@ -288,9 +297,6 @@ class SelectionService:
             po_line = po_by_item_id.get(anchor_id)
 
         # Currency resolution:
-        # - prefer PO snapshot currency if present
-        # - else facts currency
-        # - else policy default
         currency = (
             (po_line or {}).get("currency")
             or self._fact_currency(fact_map)
@@ -326,6 +332,34 @@ class SelectionService:
             if item_id:
                 idx[item_id] = l
         return idx
+
+    # =====================================================
+    # Technique access helpers (dict/object safe)
+    # =====================================================
+    def _tech_id(self, tech) -> str:
+        if isinstance(tech, dict):
+            return str(tech.get("id") or tech.get("technique_id") or "")
+        return str(getattr(tech, "id", "") or getattr(tech, "technique_id", "") or "")
+
+    def _tech_required_facts(self, tech) -> List[str]:
+        if isinstance(tech, dict):
+            return tech.get("required_facts", []) or []
+        return getattr(tech, "required_facts", []) or []
+
+    def _tech_gates(self, tech) -> Dict[str, Any]:
+        if isinstance(tech, dict):
+            return tech.get("gates", {}) or {}
+        return getattr(tech, "gates", {}) or {}
+
+    def _tech_category(self, tech) -> Optional[str]:
+        if isinstance(tech, dict):
+            return tech.get("category")
+        return getattr(tech, "category", None)
+
+    def _tech_derive(self, tech) -> Dict[str, Any]:
+        if isinstance(tech, dict):
+            return tech.get("derive", {}) or {}
+        return getattr(tech, "derive", None) or {}
 
     # =====================================================
     # Helpers
