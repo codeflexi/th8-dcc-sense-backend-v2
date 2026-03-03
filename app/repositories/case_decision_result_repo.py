@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 
 from fastapi.encoders import jsonable_encoder
 
@@ -185,7 +185,80 @@ class CaseDecisionResultRepository(BaseRepository):
         return self.case_repo.update_after_run(
             case_id,
             run_id=run_id,
-            decision=summary.overall_decision,
-            risk_level=summary.risk_level,
-            confidence=summary.confidence_avg,
+            decision=summary.get("decision"),
+            risk_level=summary.get("risk_level"),
+            confidence=summary.get("confidence")
         )
+        
+    
+     # ==========================================================
+    # INTERNAL — latest run_id แนะนำให้ใช้ ตามด้านล่าง
+    # ==========================================================
+    def _get_latest_run_id(self, case_id: str) -> Optional[str]:
+
+        res = (
+            self.sb
+            .table(self.TABLE)
+            .select("run_id, created_at")
+            .eq("case_id", case_id)
+            .eq("run_status", "COMPLETED")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            return None
+
+        return res.data[0].get("run_id")
+
+    # ==========================================================
+    # PUBLIC — list results (LATEST ONLY)
+    # ==========================================================
+    def list_by_case_last_run(
+        self,
+        *,
+        case_id: str,
+        run_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+
+        # ---------------------------------------
+        # if run_id explicitly provided → use it
+        # ---------------------------------------
+        if not run_id:
+            run_id = self._get_latest_run_id(case_id)
+
+        if not run_id:
+            return []
+
+        res = (
+            self.sb
+            .table(self.TABLE)
+            .select("*")
+            .eq("case_id", case_id)
+            .eq("run_id", run_id)
+            .order("group_id")
+            .execute()
+        )
+
+        return res.data or []
+
+    # ==========================================================
+    # OPTIONAL — for audit/debug only
+    # ==========================================================
+    def list_all_runs(
+        self,
+        case_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Use only for audit/debug
+        """
+        res = (
+            self.sb
+            .table(self.TABLE)
+            .select("*")
+            .eq("case_id", case_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return res.data or []

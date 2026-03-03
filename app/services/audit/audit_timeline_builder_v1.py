@@ -165,20 +165,20 @@ class AuditTimelineBuilderV1:
         timezone_name: str = "UTC",
     ) -> Dict[str, Any]:
         # 1) Normalize + sort events
-        normalized_events = AuditTimelineBuilder._normalize_events(raw_events)
+        normalized_events = AuditTimelineBuilderV1._normalize_events(raw_events)
 
         # 2) Assign deterministic sequence
         for idx, e in enumerate(normalized_events, start=1):
             e["sequence"] = idx
 
         # 3) Build runs aggregation
-        runs = AuditTimelineBuilder._build_runs(normalized_events)
+        runs = AuditTimelineBuilderV1._build_runs(normalized_events)
 
         # 4) Summary
-        summary = AuditTimelineBuilder._build_summary(normalized_events, runs)
+        summary = AuditTimelineBuilderV1._build_summary(normalized_events, runs)
 
         return {
-            "view_version": AuditTimelineBuilder.VIEW_VERSION,
+            "view_version": AuditTimelineBuilderV1.VIEW_VERSION,
             "case_id": case_id,
             "generated_at": _iso_utc_now(),
             "timezone": timezone_name,
@@ -209,21 +209,21 @@ class AuditTimelineBuilderV1:
             group_id = payload.get("group_id") or e.get("group_id")
 
             # domain normalization (NO "unknown")
-            domain = AuditTimelineBuilder._normalize_domain(e.get("domain"), payload, event_type)
+            domain = AuditTimelineBuilderV1._normalize_domain(e.get("domain"), payload, event_type)
 
             # category + severity
-            category = AuditTimelineBuilder._map_category(event_type)
-            severity = AuditTimelineBuilder._map_severity(event_type, payload)
+            category = AuditTimelineBuilderV1._map_category(event_type)
+            severity = AuditTimelineBuilderV1._map_severity(event_type, payload)
 
             # title + message (human-readable)
-            title = AuditTimelineBuilder._map_title(event_type, payload)
-            message = AuditTimelineBuilder._map_message(event_type, payload, domain)
+            title = AuditTimelineBuilderV1._map_title(event_type, payload)
+            message = AuditTimelineBuilderV1._map_message(event_type, payload, domain)
 
             # tags, refs, actor, ui
-            tags = AuditTimelineBuilder._build_tags(domain, category, severity, event_type, payload)
-            refs = AuditTimelineBuilder._build_refs(payload)
-            actor = AuditTimelineBuilder._build_actor(e.get("actor"), payload)
-            ui = AuditTimelineBuilder._build_ui(event_type, severity, category, domain)
+            tags = AuditTimelineBuilderV1._build_tags(domain, category, severity, event_type, payload)
+            refs = AuditTimelineBuilderV1._build_refs(payload)
+            actor = AuditTimelineBuilderV1._build_actor(e.get("actor"), payload)
+            ui = AuditTimelineBuilderV1._build_ui(event_type, severity, category, domain)
 
             normalized = {
                 "id": audit_id,
@@ -259,7 +259,7 @@ class AuditTimelineBuilderV1:
         d = _lower_or_none(event_domain) or _lower_or_none(payload.get("domain"))
 
         if not d:
-            d = AuditTimelineBuilder._infer_domain_from_event_type(event_type)
+            d = AuditTimelineBuilderV1._infer_domain_from_event_type(event_type)
 
         if not d:
             d = "system"
@@ -306,7 +306,7 @@ class AuditTimelineBuilderV1:
             payload = e.get("payload") or {}
             domain = e.get("domain") or "system"
 
-            run_category = AuditTimelineBuilder._derive_run_category(event_type, payload, domain)
+            run_category = AuditTimelineBuilderV1._derive_run_category(event_type, payload, domain)
             # normalize
             if run_category not in ALLOWED_RUN_CATEGORY:
                 run_category = "DECISION" if event_type.upper().startswith("DECISION_RUN_") else "PIPELINE"
@@ -332,13 +332,13 @@ class AuditTimelineBuilderV1:
 
             # timestamps
             ts = e.get("timestamp")
-            if AuditTimelineBuilder._is_run_started(event_type):
+            if AuditTimelineBuilderV1._is_run_started(event_type):
                 r.started_at = r.started_at or ts
                 r.status = "RUNNING"
-            if AuditTimelineBuilder._is_run_completed(event_type):
+            if AuditTimelineBuilderV1._is_run_completed(event_type):
                 r.completed_at = ts
                 r.status = "SUCCEEDED"
-            if AuditTimelineBuilder._is_run_failed(event_type):
+            if AuditTimelineBuilderV1._is_run_failed(event_type):
                 r.completed_at = ts
                 r.status = "FAILED"
 

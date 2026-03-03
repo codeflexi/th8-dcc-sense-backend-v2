@@ -70,16 +70,17 @@ class CaseRepository(BaseRepository):
     
     def update_transaction_id(self, case_id: str, transaction_id: str):
         res = (
-            self.sb.table("dcc_cases")
+            self.sb.table(self.TABLE)
             .update({"transaction_id": transaction_id})
             .eq("case_id", case_id)
             .execute()
         )
         return res.data
     
+    # ตรวจสอบว่า เตรียมข้อมูล evidence ยัง ถ้าเตรียมแล้วให้ข้าม
     def merge_case_detail(self, case_id: str, patch: dict):
         current = (
-            self.sb.table("dcc_cases")
+            self.sb.table(self.TABLE)
             .select("case_detail")
             .eq("case_id", case_id)
             .single()
@@ -92,7 +93,7 @@ class CaseRepository(BaseRepository):
         merged = {**existing, **patch}
 
         return (
-            self.sb.table("dcc_cases")
+            self.sb.table(self.TABLE)
             .update({"case_detail": merged})
             .eq("case_id", case_id)
             .execute()
@@ -228,6 +229,7 @@ class CaseRepository(BaseRepository):
                 "decision": decision,
                 "risk_level": risk_level,
                 "confidence_score": confidence,
+                "case_uuid" : case_id,
                 "updated_at": "now()",
             })
             .eq("case_id", case_id)
@@ -235,3 +237,5 @@ class CaseRepository(BaseRepository):
         )
 
         return res.data
+    
+   

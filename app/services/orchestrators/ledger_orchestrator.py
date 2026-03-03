@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Set
 
 
 def _s(x: Any) -> str:
@@ -25,6 +25,25 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _to_doc_kind(doc_type: str) -> str:
+    """
+    Normalize doc_type -> {PO, GRN, INVOICE, UNKNOWN}
+    Supports common synonyms from ERP / ingestion pipelines.
+    """
+    t = _s(doc_type).upper()
+    if not t:
+        return "UNKNOWN"
+
+    if t in ("PO", "PURCHASE_ORDER", "PROCUREMENT_PO"):
+        return "PO"
+    if t in ("GRN", "GR", "GOODS_RECEIPT", "GOODS_RECEIPT_NOTE", "RECEIPT"):
+        return "GRN"
+    if t in ("INVOICE", "INV", "AP_INVOICE", "TAX_INVOICE", "BILL"):
+        return "INVOICE"
+
+    return "UNKNOWN"
+
+
 class LedgerOrchestrator:
     """
     Finance AP 3-Way Matching orchestrator (enterprise-grade, deterministic)
@@ -34,6 +53,7 @@ class LedgerOrchestrator:
     - Aggregate PO / GRN / INVOICE lines
     - Build C3.5-compatible selection payload
     - Ensure dcc_case_evidence_groups rows exist (FK-safe)
+    - Provide artifact/readiness flags for downstream UI + decision services
     """
 
     domain = "finance_ap"
@@ -102,11 +122,12 @@ class LedgerOrchestrator:
                 or ln.get("transaction_type")
             ).upper()
 
-            if t in ("PO", "PURCHASE_ORDER", "PROCUREMENT_PO"):
+            k = _to_doc_kind(t)
+            if k == "PO":
                 po.append(ln)
-            elif t in ("GRN", "GR", "GOODS_RECEIPT"):
+            elif k == "GRN":
                 gr.append(ln)
-            elif t in ("INVOICE", "INV", "AP_INVOICE"):
+            elif k == "INVOICE":
                 inv.append(ln)
 
         return po, gr, inv
@@ -147,7 +168,6 @@ class LedgerOrchestrator:
     def _ensure_evidence_groups(
         self, *, case_id: str, case_items: List[Dict[str, Any]], created_by: str
     ) -> None:
-
         rows: List[Dict[str, Any]] = []
 
         for it in case_items or []:
@@ -177,11 +197,63 @@ class LedgerOrchestrator:
         if not rows:
             return
 
-        # ✅ correct table name
         try:
             self.sb.table("dcc_case_evidence_groups").upsert(rows).execute()
         except Exception:
             self.sb.table("dcc_case_evidence_groups").insert(rows).execute()
+
+    # =====================================================
+    # Artifact detection (best-effort)
+    # =====================================================
+
+    def _artifact_kinds_from_doc_links_best_effort(self, case_id: str) -> Set[str]:
+        """
+        Optional: derive artifact presence from linked documents.
+        This supports future where GRN/Invoice comes from PDF ingestion.
+        Safe to fail (returns empty set).
+        """
+        kinds: Set[str] = set()
+        try:
+            links_res = (
+                self.sb.table("dcc_case_document_links")
+                .select("document_id,metadata")
+                .eq("case_id", case_id)
+                .execute()
+            )
+            links = getattr(links_res, "data", None) or []
+            doc_ids = [str(r.get("document_id")) for r in links if r.get("document_id")]
+
+            # 1) try metadata first (if pipeline stamps doc_type there)
+            for r in links:
+                md = r.get("metadata") or {}
+                if isinstance(md, dict):
+                    k = _to_doc_kind(md.get("doc_type") or md.get("document_type") or md.get("type"))
+                    if k != "UNKNOWN":
+                        kinds.add(k)
+
+            if not doc_ids:
+                return kinds
+
+            # 2) then try dcc_document_header (per your architecture)
+            try:
+                hdr_res = (
+                    self.sb.table("dcc_document_header")
+                    .select("document_id,doc_type")
+                    .in_("document_id", doc_ids)
+                    .execute()
+                )
+                hdrs = getattr(hdr_res, "data", None) or []
+                for h in hdrs:
+                    k = _to_doc_kind(h.get("doc_type"))
+                    if k != "UNKNOWN":
+                        kinds.add(k)
+            except Exception:
+                pass
+
+            return kinds
+
+        except Exception:
+            return kinds
 
     # =====================================================
     # Duplicate invoice detection
@@ -195,7 +267,6 @@ class LedgerOrchestrator:
         invoice_number: str,
         current_txn_id: str,
     ) -> int:
-
         if not vendor_id or not invoice_number:
             return 0
 
@@ -226,9 +297,7 @@ class LedgerOrchestrator:
     def prepare_context(
         self, *, case_id: str, actor_id: str = "SYSTEM", force_prepare: bool = False
     ):
-        from app.services.orchestrators.base_orchestrator import (
-            OrchestratorOutput,
-        )
+        from app.services.orchestrators.base_orchestrator import OrchestratorOutput
 
         case = self._get_case(case_id)
         entity_id = _s(case.get("entity_id"))
@@ -261,11 +330,14 @@ class LedgerOrchestrator:
             current_txn_id=tx_id,
         )
 
+        # Optional: doc-links based artifacts (future: PDF ingestion)
+        linked_kinds = self._artifact_kinds_from_doc_links_best_effort(case_id)
+
         groups: List[Dict[str, Any]] = []
 
         for it in case_items or []:
             sku = _s(it.get("sku"))
-            item_id = it.get("item_id")
+            item_id = it.get("item_id") or it.get("case_line_item_id")
 
             if not sku or not item_id:
                 continue
@@ -278,6 +350,34 @@ class LedgerOrchestrator:
             over_inv_qty = max(qty_inv - qty_gr, Decimal("0"))
 
             inv_without_gr_flag = Decimal("1") if (qty_gr == 0 and qty_inv > 0) else Decimal("0")
+
+            # -------------------------
+            # Artifacts presence (enterprise)
+            # - primary: transaction lines (deterministic)
+            # - secondary: linked documents (future PDF ingestion)
+            # -------------------------
+            po_present = (qty_po > 0) or ("PO" in linked_kinds)
+            grn_present = (qty_gr > 0) or ("GRN" in linked_kinds)
+            inv_present = (qty_inv > 0) or ("INVOICE" in linked_kinds)
+
+            artifacts_ready = bool(po_present and grn_present and inv_present)
+
+            artifacts = {
+                "po": bool(po_present),
+                "grn": bool(grn_present),
+                "invoice": bool(inv_present),
+            }
+
+            readiness_flags = {
+                # canonical readiness for 3-way
+                "po_present": bool(po_present),
+                "grn_present": bool(grn_present),
+                "invoice_present": bool(inv_present),
+                "artifacts_ready": artifacts_ready,
+                # backward-compat with existing confidence logic that checks "baseline_available"
+                # interpret as "enough evidence to assert matching result"
+                "baseline_available": artifacts_ready,
+            }
 
             ap_context = {
                 "sku": sku,
@@ -293,6 +393,9 @@ class LedgerOrchestrator:
                 "invoice_number": invoice_number,
                 "invoice_fp": invoice_fp,
                 "dup_flag": int(dup_flag),
+                # expose artifacts explicitly (so builder/UI can use without extra joins)
+                "artifacts": artifacts,
+                "readiness_flags": readiness_flags,
             }
 
             groups.append(
@@ -303,7 +406,7 @@ class LedgerOrchestrator:
                     "baseline": None,
                     "baseline_source": None,
                     "selection_trace": [],
-                    "readiness_flags": {"baseline_available": True},
+                    "readiness_flags": readiness_flags,
                     "ap_context": ap_context,
                 }
             )
@@ -320,6 +423,7 @@ class LedgerOrchestrator:
             "vendor_id": vendor_id,
             "invoice_number": invoice_number,
             "entity_id": entity_id,
+            "linked_artifact_kinds": sorted(list(linked_kinds)),
         }
 
         return OrchestratorOutput(

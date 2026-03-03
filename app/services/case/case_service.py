@@ -132,9 +132,7 @@ class CaseService:
         )
         
         
-       
-
-
+    
 
         # ======================================================
         # 6) Copy PO lines into Transaction Ledger
@@ -319,4 +317,103 @@ class CaseService:
                 }
                 for li in (line_items or [])
             ],
+        })
+
+        # ==========================================================
+    # ENTERPRISE AGGREGATE (Model-aligned, frontend-ready)
+    # ==========================================================
+    def get_case_aggregate(self, case_id: str) -> Dict[str, Any]:
+
+        case = self.case_repo.get_with_entity(case_id)
+        if not case:
+            raise ValueError("Case not found")
+
+        # immutable snapshot
+        line_items = self.case_repo.list_line_items(case_id) or []
+
+        # =====================================================
+        # Artifact Summary (from case_detail.ui)
+        # =====================================================
+        attachment_summary: Dict[str, Any] = {
+            "total_count": 0,
+            "by_type": {}
+        }
+
+        case_detail = case.get("case_detail") or {}
+        if isinstance(case_detail, dict):
+            ui = case_detail.get("ui") or {}
+
+            attachment_summary["total_count"] = int(
+                ui.get("attachment_count", 0) or 0
+            )
+
+            if isinstance(ui.get("attachment_by_type"), dict):
+                attachment_summary["by_type"] = ui.get("attachment_by_type") or {}
+
+        # =====================================================
+        # Decision Tracks (multi-domain ready)
+        # =====================================================
+        decision_tracks: List[Dict[str, Any]] = []
+
+        domain_val = case.get("domain")
+        if domain_val:
+            decision_tracks.append({
+                "domain": str(domain_val).lower(),
+                "latest_decision": case.get("decision"),
+                "risk_level": case.get("risk_level"),
+                "confidence": case.get("confidence_score"),
+                "last_run_id": case.get("current_run_id"),
+            })
+
+        # =====================================================
+        # Audit Summary
+        # =====================================================
+        audit_summary: Dict[str, Any] = {
+            "has_transaction": bool(case.get("transaction_id")),
+            "status": case.get("status"),
+        }
+
+        # =====================================================
+        # Case Master (aligned with CaseMaster model)
+        # =====================================================
+        case_master: Dict[str, Any] = {
+            "case_id": case.get("case_id"),
+            "reference_type": case.get("reference_type"),
+            "reference_id": case.get("reference_id"),
+            "domain": case.get("domain"),
+            "status": case.get("status"),
+            "transaction_id": case.get("transaction_id"),
+            "created_at": case.get("created_at"),
+            "updated_at": case.get("updated_at"),
+            "entity": case.get("entity") or None,
+        }
+
+        # =====================================================
+        # Line Items (aligned with CaseLineItem model)
+        # =====================================================
+        items: List[Dict[str, Any]] = []
+
+        for li in line_items:
+            items.append({
+                "item_id": li.get("item_id"),
+                "source_line_ref": li.get("source_line_ref"),
+                "sku": li.get("sku"),
+                "item_name": li.get("item_name"),
+                "description": li.get("description"),
+                "quantity": li.get("quantity"),
+                "uom": li.get("uom"),
+                "unit_price": li.get("unit_price"),
+                "currency": li.get("currency"),
+                "total_price": li.get("total_price"),
+            })
+
+        # =====================================================
+        # Final Aggregate (match CaseAggregateResponse)
+        # =====================================================
+        return json_safe({
+            "case": case_master,
+            "artifacts": attachment_summary,
+            "decision_tracks": decision_tracks,
+            "audit": audit_summary,
+            "line_items": items,
         })

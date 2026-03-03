@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Header, HTTPException , Depends, Query , Request
 from app.services.case.case_service import CaseService
-from app.services.case.case_models import CreateCaseFromPORequest,CaseResponse
+
 from app.services.signal.signal_extraction_service import SignalExtractionService
 from app.repositories.case_repo import CaseRepository
 from app.repositories.case_line_item_repo import CaseLineItemRepository
@@ -24,6 +24,16 @@ from app.repositories.audit_repo import AuditRepository
 from app.services.audit.audit_timeline_builder_v1 import AuditTimelineBuilderV1
 import uuid
 
+from fastapi import Request
+from app.services.context.raw_loader import load_raw_decision_results_by_case
+from app.services.context.view_builder import build_decision_view
+from app.services.context.copilot_projection import project_copilot_lite
+
+from app.services.case.case_models import (
+    CreateCaseFromPORequest,
+    CaseResponse,
+    CaseAggregateResponse,CreateCaseFromPORequest,CaseResponse
+)
 
 
 
@@ -216,15 +226,20 @@ def get_case_groups(request: Request, case_id: str):
 def process_case(
     request: Request,
     case_id: str,
-    domain: str = Query(...),
     actor_id: str = Query("SYSTEM"),
 ):
     sb = request.state.sb
     service = CaseProcessingRunService(sb)
+    
+    case_repo = CaseRepository(sb)
+    case = case_repo.get_with_entity(case_id)
+    case_domain = case.get("domain")
+    
+    print(case_domain)
 
     result = service.run(
         case_id=case_id,
-        domain=domain,
+        domain=case_domain,
         actor_id=actor_id,
     )
 
@@ -284,7 +299,45 @@ async def get_case_timeline(request: Request, case_id: str):
 
     raw_events = repo.list_events_by_case(case_id)
 
-    return AuditTimelineBuilder.build(
+    return AuditTimelineBuilderV1.build(
         case_id=case_id,
         raw_events=raw_events,
     )
+    
+@router.get("/cases/{case_id}/v2/view")
+async def get_case_view_v2(request: Request, case_id: str):
+    
+    sb = request.state.sb
+    repo = AuditRepository(sb)
+
+    raw_events = repo.list_events_by_case(case_id)
+    
+    raw = await load_raw_decision_results_by_case(
+        request,
+        case_id,
+        raw_events=raw_events,
+    )
+    return build_decision_view(raw)
+
+# ==========================================================
+# ENTERPRISE AGGREGATE (Frontend Ready)
+# ==========================================================
+
+@router.get(
+    "/cases/{case_id}/aggregate",
+    response_model=CaseAggregateResponse,
+    summary="Enterprise Case Aggregate (Frontend Ready)"
+)
+def get_case_aggregate(request: Request, case_id: str):
+
+    _validate_uuid(case_id, "case_id")
+
+    try:
+        service = CaseService(request.state.sb)
+        return service.get_case_aggregate(case_id)
+
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

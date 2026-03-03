@@ -260,7 +260,6 @@ domains:
           field: "price_within_tolerance"
 
     rules:
-
       - rule_id: A-QTY-01
         group: QUANTITY
         severity: HIGH
@@ -270,8 +269,10 @@ domains:
           field: gr_exceeds_po
           operator: "=="
           value: false
-        fail_actions:
-          - REVIEW
+        fail_actions: [{type: REVIEW}]
+        explanation:
+          exec: "ยอดรับของมากกว่ายอด PO"
+          audit: "GR exceeds PO sku={ap.sku} (qty_gr={ap.qty_gr}, qty_po={ap.qty_po}, over_gr_qty={ap.over_gr_qty})"
 
       - rule_id: A-QTY-02
         group: QUANTITY
@@ -282,8 +283,10 @@ domains:
           field: inv_exceeds_gr
           operator: "=="
           value: false
-        fail_actions:
-          - REVIEW
+        fail_actions: [{type: REVIEW}]
+        explanation:
+          exec: "ยอดใบแจ้งหนี้มากกว่ายอดรับของ"
+          audit: "INV exceeds GR sku={ap.sku} (qty_inv={ap.qty_inv}, qty_gr={ap.qty_gr}, over_inv_qty={ap.over_inv_qty})"
 
       - rule_id: A-PROCESS-01
         group: PROCESS
@@ -294,8 +297,10 @@ domains:
           field: inv_without_gr
           operator: "=="
           value: false
-        fail_actions:
-          - ESCALATE
+        fail_actions: [{type: ESCALATE}]
+        explanation:
+          exec: "มีใบแจ้งหนี้แต่ยังไม่มีใบรับของ (GRN)"
+          audit: "Invoice without GR sku={ap.sku} (qty_inv={ap.qty_inv}, qty_gr={ap.qty_gr})"
 
       - rule_id: A-PRICE-01
         group: PRICE
@@ -306,8 +311,10 @@ domains:
           field: price_within_tolerance
           operator: "=="
           value: true
-        fail_actions:
-          - REVIEW
+        fail_actions: [{type: REVIEW}]
+        explanation:
+          exec: "ราคาใบแจ้งหนี้ไม่ตรงกับ PO"
+          audit: "Price mismatch sku={ap.sku} (inv={ap.inv_unit_price}, po={ap.po_unit_price}, tol_abs={meta.defaults.tolerances.price_abs})"
 
       - rule_id: A-FRAUD-01
         group: FRAUD
@@ -318,8 +325,10 @@ domains:
           field: dup_invoice
           operator: "=="
           value: false
-        fail_actions:
-          - REVIEW
+        fail_actions: [{type: REVIEW}]
+        explanation:
+          exec: "พบใบแจ้งหนี้ซ้ำ"
+          audit: "Duplicate invoice (vendor={ap.vendor_id}, invoice={ap.invoice_number}, fp={ap.invoice_fp})"
 
 # =========================================================
 # DECISION LOGIC

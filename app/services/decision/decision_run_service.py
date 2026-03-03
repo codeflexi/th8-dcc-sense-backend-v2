@@ -110,7 +110,10 @@ class DecisionRunService:
             created_by=created_by,
             inputs_snapshot=inputs_snapshot,
         )
+        
         run_id = str(run["run_id"])
+        print("RUN_ID")
+        print(run_id)
         
         print("DOMAIN =", domain_code)
         print("POLICY DOMAINS =", list(self.policy.get("domains", {}).keys()))
@@ -160,6 +163,13 @@ class DecisionRunService:
             risk_level = self._normalize_risk_level(agg["risk_level"])
             confidence = float(agg["confidence"])
             summary = self._json_safe(agg["summary"])
+            
+            summary_result = {
+                
+                "decision" : run_decision,
+                "risk_level": risk_level,
+                "confidence": confidence
+            }
 
             self.run_repo.complete_run(
                 run_id=run_id,
@@ -168,7 +178,15 @@ class DecisionRunService:
                 confidence=confidence,
                 summary=summary,
             )
+            
+            
+            self.result_repo.sync_after_success(
+                case_id,
+                run_id,
+                summary_result
+            )
 
+            
             response = {
                 "run_id": run_id,
                 "case_id": case_id,
@@ -394,7 +412,12 @@ class DecisionRunService:
                 decision_status = "REVIEW"
                 risk_level = max_severity or "MED"
 
-        confidence = self._confidence(baseline_ctx, rule_traces)
+        confidence = self._confidence(
+            baseline_ctx,
+            rule_traces,
+            artifacts_present=artifacts_present,
+            calculated=calculated,
+        )
 
         trace = self._json_safe(
             {
@@ -741,10 +764,55 @@ class DecisionRunService:
             return "REJECT"
         return "REVIEW"
 
-    def _confidence(self, baseline_ctx: Dict[str, Any], rule_traces: List[Dict[str, Any]]) -> float:
-        if not baseline_ctx.get("baseline_available"):
-            return 0.40
-        return 0.85
+    def _confidence(
+        self,
+        baseline_ctx: Dict[str, Any],
+        rule_traces: List[Dict[str, Any]],
+        artifacts_present: Optional[set] = None,
+        calculated: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        artifacts_present = artifacts_present or set()
+        calculated = calculated or {}
+
+        # ---- Evidence Score ----
+        if baseline_ctx.get("baseline_available"):
+            evidence_score = 1.0
+        else:
+            # finance_ap case
+            required = {"PO", "GR", "INVOICE"}
+            present = {a.upper() for a in artifacts_present}
+            evidence_score = len(required & present) / len(required)
+
+        # ---- Calculation Score ----
+        total_calcs = len(calculated.keys()) or 1
+        valid_calcs = sum(1 for v in calculated.values() if v is not None)
+        calculation_score = valid_calcs / total_calcs
+
+        # ---- Rule Clarity Score ----
+        fails = [r for r in rule_traces if r.get("result") == "FAIL"]
+        if not fails:
+            rule_score = 1.0
+        else:
+            clear = sum(
+                1 for r in fails
+                if r.get("calculation") and r["calculation"].get("actual") is not None
+            )
+            rule_score = clear / len(fails)
+
+        # ---- Artifact Score ----
+        if not artifacts_present:
+            artifact_score = 0.5
+        else:
+            artifact_score = min(1.0, len(artifacts_present) / 3)
+
+        confidence = (
+            evidence_score * 0.4 +
+            calculation_score * 0.2 +
+            rule_score * 0.2 +
+            artifact_score * 0.2
+        )
+
+        return round(confidence, 2)
 
     # =====================================================
     # Artifacts
