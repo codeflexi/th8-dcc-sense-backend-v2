@@ -46,12 +46,18 @@ class RuleSpec(BaseModel):
 
 class TechniqueSpec(BaseModel):
     id: str
+    domain: Optional[str] = None
     category: Optional[str] = None
     description: Optional[str] = None
+    baseline_key: Optional[str] = None
+    baseline_layer: Optional[str] = None
+    baseline_source_tag: Optional[str] = None
     required_facts: List[str] = Field(default_factory=list)
     gates: Dict[str, Any] = Field(default_factory=dict)
     derive: Dict[str, Any] = Field(default_factory=dict)
 
+    class Config:
+        extra = "allow"
 
 # =========================================================
 # DOMAIN

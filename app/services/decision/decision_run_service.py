@@ -370,13 +370,19 @@ class DecisionRunService:
         fail_actions: List[Dict[str, Any]] = []
 
         rule_ctx = {
-            "meta": self.policy.get("meta") or {},
-            "po": {"unit_price": self._normalize_money(po_line.get("unit_price"))},
-            "selection": {"baseline": baseline_ctx.get("baseline")},
-            "calculated": calculated,
-            "ap": (sel or {}).get("ap_context") or {},
-        }
-
+                "meta": self.policy.get("meta") or {},
+                "po": {"unit_price": self._normalize_money(po_line.get("unit_price"))},
+                "selection": {
+                    "baseline": baseline_ctx.get("baseline"),
+                    "baseline_source": baseline_ctx.get("baseline_source"),
+                    "baseline_layer": baseline_ctx.get("baseline_layer"),
+                    "baseline_source_tag": baseline_ctx.get("baseline_source_tag"),
+                    "baselines": baseline_ctx.get("baselines") or {},
+                },
+                "baselines": baseline_ctx.get("baselines") or {},
+                "calculated": calculated,
+                "ap": (sel or {}).get("ap_context") or {},
+            }
         self._active_fmt_ctx = rule_ctx
 
         for rule in self._iter_rules(domain_code):
@@ -422,7 +428,7 @@ class DecisionRunService:
         trace = self._json_safe(
             {
                 "policy": self._policy_meta(),
-                "inputs": {
+                "inputs": { 
                     "group_id": group_id,
                     "anchor_type": anchor_type,
                     "anchor_id": str(anchor_id) if anchor_id else None,
@@ -430,12 +436,15 @@ class DecisionRunService:
                     "artifacts_present": sorted(list(artifacts_present)),
                 },
                 "selection": {
-                    "selected_technique": (sel or {}).get("selected_technique"),
-                    "baseline": baseline_ctx.get("baseline"),
-                    "baseline_source": baseline_ctx.get("baseline_source"),
-                    "readiness_flags": readiness,
-                    "selection_refs": self._refs_from_selection(sel),
-                },
+                "selected_technique": (sel or {}).get("selected_technique"),
+                "baseline": baseline_ctx.get("baseline"),
+                "baseline_source": baseline_ctx.get("baseline_source"),
+                "baseline_layer": baseline_ctx.get("baseline_layer"),
+                "baseline_source_tag": baseline_ctx.get("baseline_source_tag"),
+                "baselines": baseline_ctx.get("baselines") or {},
+                "readiness_flags": readiness,
+                "selection_refs": self._refs_from_selection(sel),
+            },
                 "calculations": {"values": calculated, "trace": calc_trace, "error": calc_error},
                 "explainability": self._build_explainability_pack(po_line=po_line, sel=sel, calculated=calculated, rule_ctx=rule_ctx),
                 "rules": rule_traces,
@@ -646,24 +655,34 @@ class DecisionRunService:
 
     def _baseline_from_selection(self, sel: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not sel:
-            return {"baseline_available": False, "baseline": None, "baseline_source": None}
+            return {
+                "baseline_available": False,
+                "baseline": None,
+                "baseline_source": None,
+                "baseline_layer": None,
+                "baseline_source_tag": None,
+                "selected_technique": None,
+                "baselines": {},
+            }
 
         baseline = sel.get("baseline")
         baseline_source = sel.get("baseline_source")
-        if baseline and baseline.get("value") is not None:
-            return {
-                "baseline_available": True,
-                "baseline": {"value": baseline.get("value"), "currency": baseline.get("currency")},
-                "baseline_source": baseline_source,
-                "selected_technique": sel.get("selected_technique"),
-            }
-        return {
-            "baseline_available": False,
-            "baseline": None,
-            "baseline_source": baseline_source,
-            "selected_technique": sel.get("selected_technique"),
-        }
 
+        out = {
+            "baseline_available": bool(baseline and baseline.get("value") is not None),
+            "baseline": (
+                {"value": baseline.get("value"), "currency": baseline.get("currency")}
+                if baseline and baseline.get("value") is not None
+                else None
+            ),
+            "baseline_source": baseline_source,
+            "baseline_layer": sel.get("baseline_layer"),
+            "baseline_source_tag": sel.get("baseline_source_tag"),
+            "selected_technique": sel.get("selected_technique"),
+            "baselines": sel.get("baselines") or {},
+        }
+        return out
+    
     def _refs_from_selection(self, sel: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         out = {"fact_ids": [], "evidence_ids": []}
         if not sel:
@@ -691,6 +710,7 @@ class DecisionRunService:
     # =====================================================
     # Preconditions / Aggregation
     # =====================================================
+   
     def _preconditions_ok(
         self,
         pre: Dict[str, Any],
@@ -698,31 +718,63 @@ class DecisionRunService:
         artifacts_present: set[str],
         readiness: Dict[str, Any],
     ) -> bool:
-        if pre.get("baseline_available") is True:
-            if not baseline_ctx.get("baseline_available"):
+        # ---------------------------------
+        # baseline_available exact match
+        # ---------------------------------
+        if "baseline_available" in pre:
+            expected_available = bool(pre.get("baseline_available"))
+            actual_available = bool(
+                baseline_ctx.get("baseline_available")
+                and readiness.get("baseline_available", True)
+            )
+            if actual_available != expected_available:
                 return False
 
+        # ---------------------------------
+        # legacy baseline_source exact match
+        # ---------------------------------
         if "baseline_source" in pre:
             expected = str(pre.get("baseline_source") or "")
             actual = str((baseline_ctx.get("baseline_source") or {}).get("fact_type") or "")
             if expected and expected != actual:
                 return False
 
+        # ---------------------------------
+        # NEW: baseline_layer_in
+        # ---------------------------------
+        if "baseline_layer_in" in pre:
+            allowed = {str(x).strip() for x in (pre.get("baseline_layer_in") or []) if str(x).strip()}
+            actual_layer = str(baseline_ctx.get("baseline_layer") or "").strip()
+            if not actual_layer or actual_layer not in allowed:
+                return False
+
+        # ---------------------------------
+        # NEW: baseline_source_tag_in
+        # ---------------------------------
+        if "baseline_source_tag_in" in pre:
+            allowed = {str(x).strip() for x in (pre.get("baseline_source_tag_in") or []) if str(x).strip()}
+            actual_tag = str(baseline_ctx.get("baseline_source_tag") or "").strip()
+            if not actual_tag or actual_tag not in allowed:
+                return False
+
+        # ---------------------------------
+        # artifacts_present subset
+        # ---------------------------------
         if "artifacts_present" in pre:
             needed = {str(x).upper() for x in (pre.get("artifacts_present") or [])}
             if not needed.issubset(artifacts_present):
                 return False
 
+        # ---------------------------------
+        # artifact_missing
+        # ---------------------------------
         if "artifact_missing" in pre:
             missing = str(pre.get("artifact_missing") or "").upper()
             if missing and (missing in artifacts_present):
                 return False
 
-        if pre.get("baseline_available") is True and readiness.get("baseline_available") is False:
-            return False
-
         return True
-
+   
     def _aggregate_case(self, group_results: List[Dict[str, Any]]) -> Dict[str, Any]:
         worst = None
         any_review = False
@@ -861,6 +913,28 @@ class DecisionRunService:
             else:
                 out[k] = v
         return out
+    
+    def _select_explanation_by_result(
+        self,
+        explanation: Dict[str, Any],
+        result: str,
+        ctx: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if not isinstance(explanation, dict):
+            return {}
+
+        result_norm = str(result or "").upper().strip()
+        is_fail = result_norm == "FAIL"
+
+        exec_key = "exec_fail" if is_fail else "exec_pass"
+        audit_key = "audit_fail" if is_fail else "audit_pass"
+
+        selected = {
+            "exec": explanation.get(exec_key) or explanation.get("exec") or "",
+            "audit": explanation.get(audit_key) or explanation.get("audit") or "",
+        }
+
+        return self._format_explanation_obj(selected, ctx)
 
     def _format_template(self, template: str, ctx: Dict[str, Any]) -> str:
         if not template or "{" not in template:
@@ -898,6 +972,13 @@ class DecisionRunService:
         extra: Optional[Dict[str, Any]] = None,
         fmt_ctx: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        resolved_ctx = fmt_ctx or getattr(self, "_active_fmt_ctx", {}) or {}
+        selected_explanation = self._select_explanation_by_result(
+            rule.get("explanation") or {},
+            result,
+            resolved_ctx,
+        )
+
         out = {
             "rule_id": rule.get("rule_id"),
             "domain": rule.get("domain"),
@@ -906,11 +987,14 @@ class DecisionRunService:
             "result": result,
             "calculation": calculation,
             "fail_actions": fail_actions,
-            "explanation": self._format_explanation_obj(rule.get("explanation") or {}, fmt_ctx or getattr(self, "_active_fmt_ctx", {}) or {}),
+            "exec_message": selected_explanation.get("exec"),
+            "audit_message": selected_explanation.get("audit"),
+            "explanation": selected_explanation,
         }
         if extra:
             out["extra"] = extra
         return out
+    
     def _build_explainability_pack(
         self,
         *,

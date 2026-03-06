@@ -54,7 +54,7 @@ class SelectionService:
         # YAML you shared: meta.defaults.currency
         currency_default = (
             getattr(getattr(getattr(policy, "meta", None), "defaults", None), "currency", None)
-            or (getattr(getattr(policy, "meta", None), "currency_default", None))  # backward compat
+            or getattr(getattr(policy, "meta", None), "currency_default", None)  # backward compat
             or "THB"
         )
 
@@ -111,11 +111,13 @@ class SelectionService:
 
         trace: List[Dict[str, Any]] = []
         selected = None
+        baselines: Dict[str, Dict[str, Any]] = {}
 
         # Deterministic: UNGROUPED never attempts baselines
         if group_ctx.get("group_key") == "UNGROUPED":
             selected = self._fallback()
             trace.append(selected)
+            group_ctx["baselines"] = baselines
             return self._result(group_ctx, selected, trace)
 
         for tech_id in baseline_priority:
@@ -126,14 +128,30 @@ class SelectionService:
 
             r = self._evaluate_technique(group_ctx, tech)
             trace.append(r)
-            if r.get("passed") is True:
+
+            # เก็บ baseline ทุกตัวที่ derive สำเร็จ
+            if r.get("passed") is True and r.get("baseline") is not None:
+                key = self._tech_baseline_key(tech)
+                if key:
+                    baselines[key] = {
+                        "value": r["baseline"]["value"],
+                        "currency": r["baseline"]["currency"],
+                        "fact_ids": r.get("references", {}).get("fact_ids", []),
+                        "evidence_ids": r.get("references", {}).get("evidence_ids", []),
+                        "technique_id": r.get("technique_id"),
+                        "baseline_layer": r.get("baseline_layer"),
+                        "baseline_source_tag": r.get("baseline_source_tag"),
+                    }
+
+            # เลือก selected baseline ตาม priority
+            if r.get("passed") is True and selected is None:
                 selected = r
-                break
 
         if not selected:
             selected = self._fallback()
             trace.append(selected)
 
+        group_ctx["baselines"] = baselines
         return self._result(group_ctx, selected, trace)
 
     def _fallback(self) -> Dict[str, Any]:
@@ -142,6 +160,8 @@ class SelectionService:
             "passed": True,
             "baseline": None,
             "baseline_source": None,
+            "baseline_layer": None,
+            "baseline_source_tag": None,
             "fail_reasons": [],
             "references": {},
         }
@@ -158,6 +178,9 @@ class SelectionService:
             "selected_technique": selected.get("technique_id"),
             "baseline": selected.get("baseline"),
             "baseline_source": selected.get("baseline_source"),
+            "baseline_layer": selected.get("baseline_layer"),
+            "baseline_source_tag": selected.get("baseline_source_tag"),
+            "baselines": ctx.get("baselines", {}),
             "readiness_flags": {
                 "baseline_available": selected.get("baseline") is not None,
                 "evidence_present": len(ctx.get("evidences") or []) > 0,
@@ -197,6 +220,8 @@ class SelectionService:
             "passed": True,
             "baseline": None,
             "baseline_source": None,
+            "baseline_layer": self._tech_baseline_layer(tech),
+            "baseline_source_tag": self._tech_baseline_source_tag(tech),
             "fail_reasons": [],
             "references": {},
         }
@@ -246,10 +271,8 @@ class SelectionService:
         if value is None:
             return self._fail(tech_id, ["PRICE_VALUE_MISSING"])
 
-        # currency precedence:
         currency = vj.get("currency") or ctx.get("currency")
 
-        # method_required
         method_required = cfg.get("method_required")
         if method_required and vj.get("method") != method_required:
             return self._fail(tech_id, ["FACT_METHOD_MISMATCH"])
@@ -259,6 +282,8 @@ class SelectionService:
             "passed": True,
             "baseline": {"value": value, "currency": currency},
             "baseline_source": {"fact_type": ft, "method": vj.get("method")},
+            "baseline_layer": self._tech_baseline_layer(tech),
+            "baseline_source_tag": self._tech_baseline_source_tag(tech),
             "fail_reasons": [],
             "references": {
                 "fact_ids": [fact.get("fact_id")],
@@ -280,23 +305,18 @@ class SelectionService:
         group_id = group["group_id"]
         group_key = group.get("group_key")
 
-        # anchor fields (enterprise-grade)
         anchor_type = group.get("anchor_type")
         anchor_id = group.get("anchor_id")
 
-        # CRITICAL: evidences are owned by group_id (same as facts)
         evidences = self.evidence_repo.list_by_group_id(group_id)
 
-        # CRITICAL: facts are OWNED by group_id only
         facts = self.fact_repo.list_by_group(group_id)
         fact_map = {f["fact_type"]: f for f in (facts or [])}
 
-        # PO context: ONLY via anchor_id (item_id)
         po_line = None
         if anchor_type == "PO_ITEM" and anchor_id:
             po_line = po_by_item_id.get(anchor_id)
 
-        # Currency resolution:
         currency = (
             (po_line or {}).get("currency")
             or self._fact_currency(fact_map)
@@ -336,6 +356,21 @@ class SelectionService:
     # =====================================================
     # Technique access helpers (dict/object safe)
     # =====================================================
+    def _tech_baseline_key(self, tech) -> Optional[str]:
+        if isinstance(tech, dict):
+            return tech.get("baseline_key")
+        return getattr(tech, "baseline_key", None)
+
+    def _tech_baseline_layer(self, tech) -> Optional[str]:
+        if isinstance(tech, dict):
+            return tech.get("baseline_layer")
+        return getattr(tech, "baseline_layer", None)
+
+    def _tech_baseline_source_tag(self, tech) -> Optional[str]:
+        if isinstance(tech, dict):
+            return tech.get("baseline_source_tag")
+        return getattr(tech, "baseline_source_tag", None)
+
     def _tech_id(self, tech) -> str:
         if isinstance(tech, dict):
             return str(tech.get("id") or tech.get("technique_id") or "")
@@ -370,6 +405,8 @@ class SelectionService:
             "passed": False,
             "baseline": None,
             "baseline_source": None,
+            "baseline_layer": None,
+            "baseline_source_tag": None,
             "fail_reasons": reasons,
             "references": {},
         }
